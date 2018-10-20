@@ -13,6 +13,11 @@ otp_release:
   - 20.1
   - 21.0
 
+before_install:
+  - sudo add-apt-repository ppa:jonathonf/curl -y
+  - sudo apt-get update -q
+  - sudo apt-get install curl -y
+
 script: rebar3 update && rebar3 ct --readable=false && rebar3 dialyzer && rebar3 coveralls send
 
 cache:

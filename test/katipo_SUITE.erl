@@ -118,6 +118,7 @@ groups() ->
        digest_authorised,
        lock_data_ssl_session_true,
        lock_data_ssl_session_false,
+       resolve,
        badopts,
        proxy_couldnt_connect]},
      {pool, [],
@@ -481,6 +482,20 @@ lock_data_ssl_session_false(_) ->
                   #{lock_data_ssl_session => false}),
     Json = jsx:decode(Body),
     [{<<"a">>, <<"!@#$%^&*()_+">>}] = proplists:get_value(<<"args">>, Json).
+
+resolve(_) ->
+    {ok, #{status := 403, headers := Headers}} =
+        katipo:get(?POOL, <<"https://google.org">>,
+                   #{resolve => [<<"google.org:443:1.1.1.1">>],
+                     ssl_verifyhost => false}),
+    true = proplists:is_defined(<<"cf-ray">>, Headers),
+    {ok, #{status := 302, headers := Headers2}} =
+        katipo:get(?POOL, <<"https://google.org">>,
+                   #{resolve => [<<"-google.org:443">>]}),
+    <<"https://www.google.org/">> = proplists:get_value(<<"location">>, Headers2),
+    {ok, #{status := 302, headers := Headers3}} =
+        katipo:get(?POOL, <<"https://google.org">>),
+    <<"https://www.google.org/">> = proplists:get_value(<<"location">>, Headers3).
 
 badopts(_) ->
     {error, #{code := bad_opts, message := Message}} =

@@ -38,6 +38,7 @@
 #define K_CURLOPT_INTERFACE 18
 #define K_CURLOPT_UNIX_SOCKET_PATH 19
 #define K_CURLOPT_LOCK_DATA_SSL_SESSION 20
+#define K_CURLOPT_RESOLVE 21
 
 #define K_CURLAUTH_BASIC 100
 #define K_CURLAUTH_DIGEST 101
@@ -68,6 +69,7 @@ typedef struct _ConnInfo {
   struct curl_slist *resp_headers;
   struct curl_slist *req_headers;
   struct curl_slist *req_cookies;
+  struct curl_slist *req_nameservers;
   int response_code;
   char *post_data;
   long post_data_size;
@@ -216,8 +218,6 @@ static const char *curl_error_code(CURLcode error) {
       return "telnet_option_syntax";
     case CURLE_OBSOLETE50:
       return "obsolete50";
-    case CURLE_PEER_FAILED_VERIFICATION:
-      return "peer_failed_verification";
     case CURLE_GOT_NOTHING:
       return "got_nothing";
     case CURLE_SSL_ENGINE_NOTFOUND:
@@ -549,6 +549,7 @@ static void check_multi_info(GlobalInfo *global) {
       curl_slist_free_all(conn->req_cookies);
       curl_slist_free_all(conn->req_headers);
       curl_slist_free_all(conn->resp_headers);
+      curl_slist_free_all(conn->req_nameservers);
       curl_easy_cleanup(easy);
       free(conn);
     }
@@ -711,9 +712,10 @@ static void set_method(long method, ConnInfo *conn) {
 }
 
 static void new_conn(long method, char *url, struct curl_slist *req_headers,
-                     struct curl_slist *req_cookies, char *post_data,
-                     long post_data_size, EasyOpts eopts, erlang_pid *pid,
-                     erlang_ref *ref, GlobalInfo *global) {
+                     struct curl_slist *req_cookies,
+                     struct curl_slist *req_nameservers,
+                     char *post_data, long post_data_size, EasyOpts eopts,
+                     erlang_pid *pid, erlang_ref *ref, GlobalInfo *global) {
   ConnInfo *conn;
   CURLMcode rc;
   struct curl_slist *nc;
@@ -737,6 +739,7 @@ static void new_conn(long method, char *url, struct curl_slist *req_headers,
   conn->ref = ref;
   conn->req_headers = req_headers;
   conn->req_cookies = req_cookies;
+  conn->req_nameservers = req_nameservers;
   conn->post_data = post_data;
   conn->post_data_size = post_data_size;
 
@@ -805,6 +808,9 @@ static void new_conn(long method, char *url, struct curl_slist *req_headers,
     curl_easy_setopt(conn->easy, CURLOPT_COOKIELIST, nc->data);
     nc = nc->next;
   }
+  #if LIBCURL_VERSION_NUM >= 0x073E00 /* Available since 7.62.0 */
+  curl_easy_setopt(conn->easy, CURLOPT_RESOLVE, req_nameservers);
+  #endif
   if (eopts.curlopt_lock_data_ssl_session) {
     curl_easy_setopt(conn->easy, CURLOPT_SHARE, global->shobject);
   }
@@ -853,10 +859,14 @@ static void erl_input(struct bufferevent *ev, void *arg) {
 
   GlobalInfo *global = (GlobalInfo *)arg;
   struct evbuffer *input = bufferevent_get_input(from_erlang);
-  struct curl_slist *req_headers;
-  struct curl_slist *req_cookies;
+  struct curl_slist *req_headers = NULL;
+  struct curl_slist *req_cookies = NULL;
+  struct curl_slist *req_nameservers = NULL;
+  int num_nameservers = 0;
+  int nameserver_i;
   char *header;
   char *cookie;
+  char *nameserver;
   int num_headers;
   int num_cookies;
   int i;
@@ -915,7 +925,7 @@ static void erl_input(struct bufferevent *ev, void *arg) {
     if (ei_decode_list_header(buf, &index, &num_headers)) {
       errx(2, "Couldn't decode headers length");
     }
-    req_headers = NULL;
+
     for (i = 0; i < num_headers; i++) {
       if (ei_get_type(buf, &index, &erl_type, &size)) {
         errx(2, "Couldn't read header size");
@@ -936,7 +946,7 @@ static void erl_input(struct bufferevent *ev, void *arg) {
     if (ei_decode_list_header(buf, &index, &num_cookies)) {
       errx(2, "Couldn't decode cookies length");
     }
-    req_cookies = NULL;
+
     for (i = 0; i < num_cookies; i++) {
       if (ei_get_type(buf, &index, &erl_type, &size)) {
         errx(2, "Couldn't read cookie size");
@@ -1075,6 +1085,37 @@ static void erl_input(struct bufferevent *ev, void *arg) {
           errx(2, "Couldn't skip eopt atom value");
         }
         break;
+      case ERL_NIL_EXT:
+      case ERL_LIST_EXT:
+        switch (eopt) {
+        case K_CURLOPT_RESOLVE:
+          // list of dns servers
+          if (ei_decode_list_header(buf, &index, &num_nameservers)) {
+            errx(2, "Failed to decode nameservers list header");
+          }
+          for (nameserver_i = 0; nameserver_i < num_nameservers; nameserver_i++) {
+            if (ei_get_type(buf, &index, &erl_type, &size) ||
+                erl_type != ERL_BINARY_EXT) {
+              errx(2, "Couldn't read nameserver");
+            }
+            nameserver = (char *)malloc(size + 1);
+            if (ei_decode_binary(buf, &index, nameserver, &sizel)) {
+              errx(2, "Couldn't read nameserver");
+            }
+            nameserver[size] = '\0';
+            req_nameservers = curl_slist_append(req_nameservers, nameserver);
+            free(nameserver);
+          }
+
+          if (num_nameservers > 0 && ei_skip_term(buf, &index) != 0) {
+            errx(2, "Couldn't skip empty list");
+          }
+
+          break;
+        default:
+          errx(2, "Unknown eopt list value %ld", eopt);
+        }
+        break;
       default:
         errx(2, "Couldn't read eopt value '%c'", erl_type);
         break;
@@ -1085,8 +1126,8 @@ static void erl_input(struct bufferevent *ev, void *arg) {
       errx(2, "Couldn't skip empty eopt list");
     }
 
-    new_conn(method, url, req_headers, req_cookies, post_data, post_data_size,
-             eopts, pid, ref, arg);
+    new_conn(method, url, req_headers, req_cookies, req_nameservers, post_data,
+             post_data_size, eopts, pid, ref, arg);
 
     free(buf);
   }
