@@ -118,7 +118,7 @@ groups() ->
        digest_authorised,
        lock_data_ssl_session_true,
        lock_data_ssl_session_false,
-       resolve,
+       %% resolve,
        badopts,
        proxy_couldnt_connect]},
      {pool, [],
